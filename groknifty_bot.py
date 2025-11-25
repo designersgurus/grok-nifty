@@ -13,13 +13,13 @@ nltk.download('vader_lexicon')
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
 
-# Environment vars (set in Heroku or local)
+# Environment vars (set in Replit or local)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 NEWS_URL = 'https://www.moneycontrol.com/news/business/markets/'
 FII_DII_URL = 'https://www.moneycontrol.com/news/business/markets/'  # Scrape or use API
 
 # DB (simple dict for start, use SQLite later)
-users = {}  # user_id: {'tier': 'free', 'positions': [], 'data_opt_in': False, 'credits': 0, 'predictions_today': 0, 'positions_month': 0, 'paid': False, 'admin': False}
+users = {}  # user_id: {'tier': 'free', 'positions': [], 'data_opt_in': False, 'credits': 0, 'predictions_today': 0, 'positions_month': 0, 'paid': False}
 
 # Prediction model (simple)
 model = LinearRegression()  # Simple ML for range
@@ -27,9 +27,6 @@ historical_data = pd.DataFrame()  # Load or fetch
 
 # Sentiment analyzer
 sia = SentimentIntensityAnalyzer()
-
-# Admin ID (set your Telegram user ID here for security)
-ADMIN_ID = 123456789  # Replace with your actual Telegram user ID
 
 def fetch_pre_market():
     # Gift Nifty (yfinance for Bank Nifty)
@@ -61,12 +58,7 @@ def update_logic(previous, current):
 def start(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     if user_id not in users:
-        users[user_id] = {'tier': 'free', 'positions': [], 'data_opt_in': False, 'credits': 0, 'predictions_today': 0, 'positions_month': 0, 'paid': False, 'admin': user_id == ADMIN_ID}
-    if users[user_id]['admin']:
-        users[user_id]['tier'] = 'diamond'  # Admin always diamond
-    if not users[user_id]['paid']:
-        update.message.reply_text("Please complete payment to select tier or contact admin.")
-        return
+        users[user_id] = {'tier': 'free', 'positions': [], 'data_opt_in': False, 'credits': 0, 'predictions_today': 0, 'positions_month': 0}
     update.message.reply_text("Welcome to GrokNifty! Choose tier:", reply_markup=get_tier_menu())
 
 def get_tier_menu():
@@ -119,9 +111,7 @@ def position_input(update: Update, context: CallbackContext):
         update.message.reply_text("Invalid format. Try: BUY BANKNIFTY NOV 59500 CE @ 215 3 lots")
 
 def auto_fetch():
-    for user_id in users:
-        tier = users[user_id]['tier']
-        # ... (same as before, add diamond/gold schedules in schedule_tasks)
+    # ... (same as before)
 
 def schedule_tasks():
     # ... (same as before)
