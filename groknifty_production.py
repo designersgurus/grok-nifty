@@ -436,7 +436,8 @@ def predict_on_demand(update, context):
             for p in positions[:5]:  # show up to 5 latest
                 approx_pl, sign = estimate_option_pl(p, pred_price)
                 pos_text += f"\n- {p['action']} {p['index_symbol']} {p['month']} {p['strike']}{p['opt_type']} @ {p['price']} qty:{p['qty']} => EstPL:{approx_pl:.2f} ({sign})"
-        text = (f"GrokNifty Prediction ({datetime.now().strftime('%Y-%m-%d %H:%M IST')}):\n"
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M IST')
+                text = f"GrokNifty Prediction ({timestamp}):\n"
                 f"Spot: {spot:.2f}\n"
                 f"Predicted Next Close: {pred_price:.2f} ({pred_return*100:.2f}%)\n"
                 f"Estimated Range: Low {low:.2f} — High {high:.2f}\n"
