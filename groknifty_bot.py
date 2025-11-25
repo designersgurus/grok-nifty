@@ -38,6 +38,9 @@ FII_DII_URL = "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/
 
 users = {}  # Simple in-memory database
 
+# Global updater so scheduler can use it
+updater = None
+
 
 # -------------------------------------------------------------------
 # Data Fetching
@@ -141,13 +144,16 @@ def manual_predict(update, context):
 scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
 
 
-def auto_push_predictions(context):
+def auto_push_predictions():
+    global updater
+    bot = updater.bot
+
     for user_id, data in users.items():
         spot, fii, dii, sentiment = fetch_pre_market()
         bias = (dii - fii) / 1000 + sentiment * 5
         low, high = predict_range(bias, spot)
 
-        context.bot.send_message(
+        bot.send_message(
             chat_id=user_id,
             text=f"📈 *Auto Update*\nNifty Range: {low} - {high}",
             parse_mode="Markdown",
@@ -158,6 +164,12 @@ def auto_push_predictions(context):
 # Runner
 # -------------------------------------------------------------------
 def main():
+    global updater
+
+    if not TELEGRAM_TOKEN:
+        print("❌ ERROR: TELEGRAM_TOKEN not found! Set it in /etc/groknifty/groknifty.env")
+        return
+
     updater = Updater(TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
 
@@ -165,6 +177,7 @@ def main():
     dp.add_handler(CommandHandler("predict", manual_predict))
     dp.add_handler(CallbackQueryHandler(tier_callback))
 
+    # Scheduled tasks
     scheduler.add_job(auto_push_predictions, "cron", hour="9", minute="10")
     scheduler.add_job(auto_push_predictions, "cron", hour="12", minute="00")
     scheduler.start()
