@@ -18,7 +18,7 @@ frozendict==2.3.8
 
 # Scheduler
 schedule==1.2.1
-apscheduler==3.10.4
+apscheduler==3.6.3
 
 # Logs & Utils
 python-dateutil==2.9.0
@@ -37,4 +37,5 @@ certifi==2023.11.17
 urllib3==2.1.0
 idna==3.4
 charset-normalizer==3.3.2
+
 
