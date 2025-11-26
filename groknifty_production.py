@@ -1,588 +1,669 @@
-#!/usr/bin/env python3
-"""
-GrokNifty Production Bot - Option B (Advanced)
-Features:
-- Telegram bot (python-telegram-bot v13)
-- Tier selection and user management stored in SQLite
-- Position parsing and storage
-- Market data fetch (yfinance)
-- Headlines sentiment (nltk VADER)
-- ML model (RandomForest) with daily auto-train
-- Scheduler (APScheduler) for tiered pushes
-- Logging and exception handling
-- Environment variables loaded from /etc/groknifty/groknifty.env via systemd
-
-Note: SSH public key uploaded by user is available at:
-'/mnt/data/ssh-key-2025-11-23.key (1).pub'
-(Stored here only for reference; not used by the bot.)
-"""
+# groknifty_production.py
+# Option C - Hybrid (ML + statistical fallback) dynamic Nifty/BankNifty bot
+# Put this at ~/grok-nifty/groknifty_production.py
+# Requires python packages: python-telegram-bot==13.15, yfinance, scikit-learn, pandas, joblib, apscheduler, nltk, beautifulsoup4, requests, sqlite3 (stdlib), etc.
 
 import os
 import sys
 import time
-import json
 import logging
 import sqlite3
-from contextlib import closing
+import traceback
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from functools import partial
+from typing import Tuple, Dict, Any, List
 
 import joblib
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
+import requests
 from bs4 import BeautifulSoup
-
+from apscheduler.schedulers.background import BackgroundScheduler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
-
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Updater,
-    CommandHandler,
-    MessageHandler,
-    Filters,
-    CallbackQueryHandler,
-)
-
+from sklearn.metrics import mean_absolute_error
+from telegram import Update, Bot, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler, CallbackContext
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 
-# Ensure vader lexicon is available
-try:
-    nltk.data.find('sentiment/vader_lexicon')
-except Exception:
-    nltk.download('vader_lexicon')
+# Path to uploaded public key (developer note: transform to URL if needed)
+SSH_PUB_KEY_PATH = "/mnt/data/ssh-key-2025-11-23.key (1).pub"
 
+# -------------------------
+# Configuration & Env load
+# -------------------------
+# Try environment variables, else try /etc/groknifty/groknifty.env
+ENV_FILE = "/etc/groknifty/groknifty.env"
+
+def load_env_file(path=ENV_FILE):
+    if os.path.exists(path):
+        try:
+            # load lines like KEY=VALUE, ignore comments
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        v = v.strip().strip('"').strip("'")
+                        os.environ.setdefault(k.strip(), v)
+        except Exception as e:
+            print("Failed to load env file:", e)
+
+load_env_file()
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ADMIN_IDS = set()
+if os.environ.get("ADMIN_IDS"):
+    try:
+        ADMIN_IDS = set(int(i.strip()) for i in os.environ.get("ADMIN_IDS", "").split(",") if i.strip())
+    except:
+        ADMIN_IDS = set()
+
+if not TELEGRAM_TOKEN:
+    print("ERROR: TELEGRAM_TOKEN not set in environment.")
+    sys.exit(1)
+
+# Prediction model files
+MODEL_DIR = os.path.join(os.getcwd(), "models")
+os.makedirs(MODEL_DIR, exist_ok=True)
+MODEL_PATH = os.path.join(MODEL_DIR, "grok_model.joblib")
+MODEL_META = os.path.join(MODEL_DIR, "grok_model_meta.joblib")
+
+# DB
+DB_PATH = os.path.join(os.getcwd(), "grok.db")
+
+# URLs / scrapers
+NEWS_URL = "https://www.moneycontrol.com/news/business/markets/"
+FII_DII_URL = "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.html"
+
+# Logging
+LOG_FILE = os.path.join(os.getcwd(), "groknifty.log")
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ],
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("grok-nifty")
+
+# NLTK setup
+nltk.download("vader_lexicon", quiet=True)
 sia = SentimentIntensityAnalyzer()
 
-# -------------------- Configuration --------------------
-ENV_FILE = '/etc/groknifty/groknifty.env'
-MODEL_PATH = '/home/ubuntu/grok-nifty/model.pkl'
-DB_PATH = '/home/ubuntu/grok-nifty/groknifty.db'
-LOG_PATH = '/home/ubuntu/grok-nifty/groknifty.log'
-DATA_DIR = '/home/ubuntu/grok-nifty/data'
-SSH_KEY_PUB = '/mnt/data/ssh-key-2025-11-23.key (1).pub'
+# Scheduler
+scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+# We'll start scheduler after Updater initialization.
 
-NEWS_URL = 'https://www.moneycontrol.com/news/business/markets/'
-FII_DII_URL = 'https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.html'
-TICKER = '^NSEI'  # NIFTY index
-HIST_PERIOD = '3y'
-
-scheduler = BackgroundScheduler(timezone='Asia/Kolkata')
-updater = None
-bot = None
-MODEL = None
-MODEL_FEATURES: List[str] = []
-
-# -------------------- Logging --------------------
-logger = logging.getLogger('groknifty')
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    fh = logging.FileHandler(LOG_PATH)
-    fh.setLevel(logging.INFO)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-    fh.setFormatter(fmt)
-    ch.setFormatter(fmt)
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
-# -------------------- Utilities --------------------
-
-def load_env(path: str = ENV_FILE) -> Dict[str, str]:
-    env = {}
-    if os.path.exists(path):
-        with open(path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                if '=' in line:
-                    k, v = line.split('=', 1)
-                    env[k.strip()] = v.strip().strip('"').strip("'")
-    return env
-
-
-def ensure_dirs():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-
-
-# -------------------- Database --------------------
-
+# -------------------------
+# Utilities: DB
+# -------------------------
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            tier TEXT DEFAULT 'free',
-            subscribed INTEGER DEFAULT 1,
-            created_at TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT,
-            index_symbol TEXT,
-            month TEXT,
-            strike INTEGER,
-            opt_type TEXT,
-            price REAL,
-            qty INTEGER,
-            created_at TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS predictions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            dt TEXT,
-            spot REAL,
-            low REAL,
-            high REAL,
-            confidence REAL
-        )
-    ''')
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        tg_id INTEGER UNIQUE,
+        tier TEXT DEFAULT 'free',
+        created_at TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS positions (
+        id INTEGER PRIMARY KEY,
+        user_tg_id INTEGER,
+        action TEXT,
+        index_symbol TEXT,
+        month TEXT,
+        strike INTEGER,
+        opt_type TEXT,
+        price REAL,
+        qty INTEGER,
+        raw_text TEXT,
+        created_at TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS models (
+        id INTEGER PRIMARY KEY,
+        path TEXT,
+        trained_at TEXT,
+        score REAL
+    )
+    """)
     conn.commit()
-    conn.close()
-    logger.info('DB initialized at %s', DB_PATH)
+    return conn
 
+DB_CONN = init_db()
 
-def add_or_get_user(user_id: int) -> Dict[str, Any]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT user_id, tier, subscribed FROM users WHERE user_id=?', (user_id,))
-    row = c.fetchone()
-    if row:
-        conn.close()
-        return {'user_id': row[0], 'tier': row[1], 'subscribed': bool(row[2])}
-    c.execute('INSERT INTO users(user_id, tier, subscribed, created_at) VALUES (?, ?, ?, ?)',
-              (user_id, 'free', 1, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-    return {'user_id': user_id, 'tier': 'free', 'subscribed': True}
+# -------------------------
+# Helper: index detection
+# -------------------------
+def detect_index_from_text(text: str) -> str:
+    t = text.upper()
+    if "BANKNIFTY" in t or "BANK NIFTY" in t or ("BN" in t and "BANK" in t):
+        return "BANKNIFTY"
+    if "NIFTY" in t or "NSEI" in t:
+        return "NIFTY"
+    # fallback default
+    return "BANKNIFTY"
 
+def get_index_ticker(index_name: str) -> str:
+    if index_name == "BANKNIFTY":
+        return "^NSEBANK"
+    if index_name == "NIFTY":
+        return "^NSEI"
+    return "^NSEBANK"
 
-def save_position_db(user_id: int, pos: Dict[str, Any]):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO positions(user_id, action, index_symbol, month, strike, opt_type, price, qty, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-              (user_id, pos['action'], pos['index_symbol'], pos['month'], pos['strike'], pos['opt_type'], pos['price'], pos['qty'], datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+# -------------------------
+# Data fetchers
+# -------------------------
+def fetch_spot_and_sentiment(index_name: str) -> Tuple[float, float]:
+    """
+    Returns (spot_price, sentiment_score)
+    sentiment_score is average compound across top headlines
+    """
+    ticker = get_index_ticker(index_name)
+    try:
+        df = yf.download(ticker, period="2d", interval="1d", progress=False)
+        spot = float(df["Close"].iloc[-1]) if not df.empty else None
+    except Exception as e:
+        logger.exception("yfinance failed: %s", e)
+        spot = None
 
+    # simple sentiment
+    try:
+        resp = requests.get(NEWS_URL, timeout=8)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Extract headlines broadly
+        headlines = [h.text.strip() for h in soup.find_all(["h2", "h3"])][:10]
+        if headlines:
+            sentiment = np.mean([sia.polarity_scores(h)["compound"] for h in headlines])
+        else:
+            sentiment = 0.0
+    except Exception as e:
+        logger.warning("News fetch failed: %s", e)
+        sentiment = 0.0
 
-def get_positions_db(user_id: int) -> List[Dict[str, Any]]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, action, index_symbol, month, strike, opt_type, price, qty, created_at FROM positions WHERE user_id=? ORDER BY id DESC', (user_id,))
-    rows = c.fetchall()
-    conn.close()
-    out = []
-    for r in rows:
-        out.append({'id': r[0], 'action': r[1], 'index_symbol': r[2], 'month': r[3], 'strike': r[4], 'opt_type': r[5], 'price': r[6], 'qty': r[7], 'created_at': r[8]})
-    return out
-
-
-def save_prediction_db(user_id: int, spot: float, low: float, high: float, confidence: float):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO predictions(user_id, dt, spot, low, high, confidence) VALUES (?, ?, ?, ?, ?, ?)',
-              (user_id, datetime.utcnow().isoformat(), spot, low, high, confidence))
-    conn.commit()
-    conn.close()
-
-
-# -------------------- Data & Features --------------------
-
-def fetch_historical(ticker: str = TICKER, period: str = HIST_PERIOD) -> pd.DataFrame:
-    for attempt in range(3):
+    if spot is None:
+        # fallback: try ticker quick fetch
         try:
-            df = yf.download(ticker, period=period, interval='1d', progress=False)
-            if df is not None and not df.empty:
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-                df.dropna(inplace=True)
-                return df
-        except Exception as e:
-            logger.warning('fetch_historical attempt %s failed: %s', attempt + 1, e)
-            time.sleep(2)
-    raise RuntimeError('Unable to fetch historical data for ' + ticker)
+            info = yf.Ticker(ticker).history(period="1d")
+            spot = float(info["Close"].iloc[-1]) if not info.empty else 0.0
+        except:
+            spot = 0.0
 
+    return float(spot), float(sentiment)
 
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df['ret_1'] = df['Close'].pct_change(1)
-    df['ret_5'] = df['Close'].pct_change(5)
-    df['sma_5'] = df['Close'].rolling(5).mean()
-    df['sma_10'] = df['Close'].rolling(10).mean()
-    df['vol_5'] = df['ret_1'].rolling(5).std()
-    df['mom_5'] = df['Close'] / df['Close'].shift(5) - 1
-    delta = df['Close'].diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    roll_up = up.rolling(14).mean()
-    roll_down = down.rolling(14).mean()
-    rs = roll_up / (roll_down + 1e-9)
-    df['rsi_14'] = 100 - (100 / (1 + rs))
-    df['target'] = df['Close'].shift(-1) / df['Close'] - 1
-    df.dropna(inplace=True)
+def fetch_historical_df(index_name: str, days: int = 90) -> pd.DataFrame:
+    ticker = get_index_ticker(index_name)
+    df = yf.download(ticker, period=f"{days}d", interval="1d", progress=False)
+    if df is None or df.empty:
+        raise RuntimeError("No historical data fetched for " + ticker)
+    df = df.dropna()
     return df
 
+# -------------------------
+# Feature engineering & model
+# -------------------------
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # basic features: returns, moving averages, vol
+    df["ret_1"] = df["Close"].pct_change(1)
+    df["ret_3"] = df["Close"].pct_change(3)
+    df["ma_5"] = df["Close"].rolling(5).mean()
+    df["ma_10"] = df["Close"].rolling(10).mean()
+    df["vol_5"] = df["Close"].rolling(5).std()
+    df["vol_10"] = df["Close"].rolling(10).std()
+    df["target_next"] = df["Close"].shift(-1)  # predict next day close
+    df = df.dropna()
+    return df
 
-# -------------------- Model --------------------
-
-def train_and_persist_model(model_path: str = MODEL_PATH) -> Tuple[Any, List[str]]:
-    logger.info('Training model...')
-    df = fetch_historical()
-    df = compute_features(df)
-    features = ['ret_1', 'ret_5', 'sma_5', 'sma_10', 'vol_5', 'mom_5', 'rsi_14']
-    X = df[features]
-    y = df['target']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    model = RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
-    model.fit(X_train, y_train)
-    preds = model.predict(X_test)
-    mse = mean_squared_error(y_test, preds)
-    logger.info('Model trained. Test MSE: %.8f', mse)
-    joblib.dump({'model': model, 'features': features}, model_path)
-    logger.info('Model persisted to %s', model_path)
-    return model, features
-
-
-def load_model(model_path: str = MODEL_PATH):
-    global MODEL, MODEL_FEATURES
-    if os.path.exists(model_path):
-        logger.info('Loading persisted model...')
-        data = joblib.load(model_path)
-        MODEL = data['model']
-        MODEL_FEATURES = data['features']
-    else:
-        MODEL, MODEL_FEATURES = train_and_persist_model()
-    return MODEL, MODEL_FEATURES
-
-
-def predict_next_move(latest_df: pd.DataFrame) -> Tuple[float, float, float, float, float, float]:
-    global MODEL, MODEL_FEATURES
-    if MODEL is None:
-        load_model()
-    last = latest_df.copy().iloc[-1:]
-    X = last[MODEL_FEATURES]
-    pred_return = float(MODEL.predict(X)[0])
-    spot = float(last['Close'].iloc[0])
-    pred_price = spot * (1 + pred_return)
-    hist_vol = latest_df['ret_1'].rolling(20).std().iloc[-1]
-    band = max(0.002, hist_vol if not np.isnan(hist_vol) else 0.01)
-    low = pred_price * (1 - 1.5 * band)
-    high = pred_price * (1 + 1.5 * band)
-    confidence = max(0.0, 1 - min(1.0, abs(pred_return) / (3 * (hist_vol if hist_vol > 0 else 0.01))))
-    return pred_return, low, high, spot, pred_price, confidence
-
-
-# -------------------- Fetch helpers --------------------
-
-def fetch_fii_dii() -> Tuple[float, float]:
+def train_model_for_index(index_name: str) -> Dict[str, Any]:
+    """
+    Train RandomForest and save model. Returns metadata dict.
+    """
     try:
-        resp = requests.get(FII_DII_URL, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        fii = soup.select_one('.fii span.value')
-        dii = soup.select_one('.dii span.value')
-        fii_val = float(fii.text.replace(',', '')) if fii else 0.0
-        dii_val = float(dii.text.replace(',', '')) if dii else 0.0
-        return fii_val, dii_val
-    except Exception as e:
-        logger.warning('FII/DII fetch failed: %s', e)
-        return 0.0, 0.0
-
-
-def fetch_headlines_sentiment() -> float:
-    try:
-        resp = requests.get(NEWS_URL, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        headlines = [h.get_text(strip=True) for h in soup.find_all('h2', limit=10)]
-        if not headlines:
-            return 0.0
-        sentiment = sum(sia.polarity_scores(h)['compound'] for h in headlines) / len(headlines)
-        return sentiment
-    except Exception as e:
-        logger.warning('Headline fetch failed: %s', e)
-        return 0.0
-
-
-# -------------------- Position parsing & evaluation --------------------
-
-def parse_position_text(text: str) -> Optional[Dict[str, Any]]:
-    try:
-        txt = text.upper().strip()
-        txt = txt.replace(',', ' ')
-        words = txt.split()
-        if len(words) < 6:
-            return None
-        action = words[0]
-        if action not in ('BUY', 'SELL'):
-            return None
-        index_symbol = words[1]
-        month = words[2]
-        strike = int(words[3])
-        opt_type = words[4]
-        price = None
-        qty = 1
-        if '@' in words:
-            at_idx = words.index('@')
-            if at_idx + 1 < len(words):
-                try:
-                    price = float(words[at_idx + 1])
-                except Exception:
-                    price = None
-                if at_idx + 2 < len(words):
-                    nxt = words[at_idx + 2]
-                    digits = ''.join(ch for ch in nxt if ch.isdigit())
-                    if digits:
-                        qty = int(digits)
-        else:
-            try:
-                price = float(words[5])
-            except Exception:
-                price = None
-        if price is None:
-            return None
-        return {
-            'action': action,
-            'index_symbol': index_symbol,
-            'month': month,
-            'strike': strike,
-            'opt_type': opt_type,
-            'price': price,
-            'qty': qty
+        df = fetch_historical_df(index_name, days=120)
+        df = compute_features(df)
+        features = ["Close", "ret_1", "ret_3", "ma_5", "ma_10", "vol_5", "vol_10"]
+        X = df[features].values
+        y = df["target_next"].values
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
+        model = RandomForestRegressor(n_estimators=150, random_state=42, n_jobs=-1)
+        model.fit(X_train, y_train)
+        preds = model.predict(X_val)
+        mae = mean_absolute_error(y_val, preds)
+        # Save model
+        meta = {
+            "index": index_name,
+            "trained_at": datetime.now().isoformat(),
+            "mae": float(mae)
         }
+        file_name = f"grok_model_{index_name}.joblib"
+        path = os.path.join(MODEL_DIR, file_name)
+        joblib.dump({"model": model, "features": features}, path)
+        # store meta
+        joblib.dump(meta, MODEL_META.replace(".joblib", f"_{index_name}.joblib"))
+        # Save DB record
+        cur = DB_CONN.cursor()
+        cur.execute("INSERT INTO models (path, trained_at, score) VALUES (?, ?, ?)", (path, meta["trained_at"], meta["mae"]))
+        DB_CONN.commit()
+        logger.info("Trained model %s saved to %s (mae=%s)", index_name, path, mae)
+        return {"path": path, **meta}
     except Exception as e:
-        logger.exception('parse_position_text error: %s', e)
-        return None
+        logger.exception("Model training failed for %s: %s", index_name, e)
+        return {}
 
+def load_model_for_index(index_name: str):
+    file_name = f"grok_model_{index_name}.joblib"
+    path = os.path.join(MODEL_DIR, file_name)
+    if os.path.exists(path):
+        try:
+            data = joblib.load(path)
+            return data.get("model"), data.get("features")
+        except Exception as e:
+            logger.warning("Failed to load model at %s: %s", path, e)
+            return None, None
+    return None, None
 
-def estimate_option_pl(position: Dict[str, Any], predicted_price: float) -> Tuple[float, str]:
+# -------------------------
+# Prediction wrapper (Hybrid)
+# -------------------------
+def predict_next(df: pd.DataFrame, index_name: str) -> Dict[str, Any]:
+    """
+    Returns dict with:
+      spot, pred_price, pred_return, low, high, confidence
+    """
+    spot, sentiment = fetch_spot_and_sentiment(index_name)
+    features = ["Close", "ret_1", "ret_3", "ma_5", "ma_10", "vol_5", "vol_10"]
+    # Statistical fallback: simple range using today's close and vol
+    last_close = float(df["Close"].iloc[-1])
+    today_vol = float(df["Close"].pct_change().rolling(10).std().iloc[-1] or 0.0)
+    # default fallback prediction
+    low_fallback = last_close * (1 - 0.01 - today_vol)
+    high_fallback = last_close * (1 + 0.01 + today_vol)
+    pred_fallback = last_close * (1 + 0.001)  # tiny move
+    confidence_fallback = 0.2
+
+    # Try ML prediction
+    model, feat_list = load_model_for_index(index_name)
     try:
-        strike = position['strike']
-        opt_type = position['opt_type']
-        entry_price = position['price']
-        move = predicted_price - strike if opt_type == 'CE' else strike - predicted_price
-        underlying_move = move / max(1.0, strike)
-        abs_pct = abs(underlying_move)
-        if abs_pct < 0.005:
-            delta = 0.15
-        elif abs_pct < 0.01:
-            delta = 0.3
-        elif abs_pct < 0.02:
-            delta = 0.45
+        if model is not None:
+            # prepare last row features
+            df_feat = compute_features(df)
+            last = df_feat.iloc[-1]
+            x = np.array([last[f] for f in feat_list]).reshape(1, -1)
+            pred_price = float(model.predict(x)[0])
+            pred_return = (pred_price - last_close) / last_close
+            # range using predicted return +/- volatility * factor
+            vol = float(df_feat["ret_1"].rolling(10).std().iloc[-1] or 0.0)
+            low = pred_price * (1 - 0.01 - vol)
+            high = pred_price * (1 + 0.01 + vol)
+            confidence = max(0.05, 1.0 - abs(pred_return) / 0.1)  # heuristic
+            return {
+                "spot": spot,
+                "pred_price": pred_price,
+                "pred_return": pred_return,
+                "low": low,
+                "high": high,
+                "confidence": confidence,
+                "sentiment": sentiment,
+                "method": "ml"
+            }
         else:
-            delta = 0.65
-        approx_pl = (delta * (predicted_price - strike)) - entry_price if opt_type == 'CE' else (delta * (strike - predicted_price)) - entry_price
-        sign = 'Favourable' if approx_pl > 0 else ('Neutral' if abs(approx_pl) < entry_price * 0.1 else 'Risky')
-        return approx_pl, sign
+            raise RuntimeError("No model")
     except Exception as e:
-        logger.exception('estimate_option_pl error: %s', e)
-        return 0.0, 'Unknown'
+        logger.warning("ML predict failed: %s. Using fallback", e)
+        return {
+            "spot": spot,
+            "pred_price": pred_fallback,
+            "pred_return": (pred_fallback - last_close) / last_close,
+            "low": low_fallback,
+            "high": high_fallback,
+            "confidence": confidence_fallback,
+            "sentiment": sentiment,
+            "method": "fallback"
+        }
 
+# -------------------------
+# Positions & Users helpers
+# -------------------------
+def get_user_row(tg_id: int):
+    cur = DB_CONN.cursor()
+    cur.execute("SELECT tg_id, tier FROM users WHERE tg_id = ?", (tg_id,))
+    r = cur.fetchone()
+    if r:
+        return {"tg_id": r[0], "tier": r[1]}
+    return None
 
-# -------------------- Telegram Handlers --------------------
+def ensure_user(tg_id: int):
+    cur = DB_CONN.cursor()
+    row = get_user_row(tg_id)
+    if row:
+        return row
+    cur.execute("INSERT INTO users (tg_id, tier, created_at) VALUES (?, ?, ?)", (tg_id, "free", datetime.now().isoformat()))
+    DB_CONN.commit()
+    return get_user_row(tg_id)
 
-def get_tier_menu_markup() -> InlineKeyboardMarkup:
+def save_position(parsed: dict):
+    cur = DB_CONN.cursor()
+    cur.execute("""
+        INSERT INTO positions (user_tg_id, action, index_symbol, month, strike, opt_type, price, qty, raw_text, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (parsed.get("user_id"), parsed.get("action"), parsed.get("index_symbol"), parsed.get("month"),
+          parsed.get("strike"), parsed.get("opt_type"), parsed.get("price"), parsed.get("qty"),
+          parsed.get("raw_text"), datetime.now().isoformat()))
+    DB_CONN.commit()
+
+def get_positions_for_user(tg_id: int, limit=20) -> List[Dict[str, Any]]:
+    cur = DB_CONN.cursor()
+    cur.execute("SELECT action, index_symbol, month, strike, opt_type, price, qty, raw_text, created_at FROM positions WHERE user_tg_id = ? ORDER BY id DESC LIMIT ?", (tg_id, limit))
+    rows = cur.fetchall()
+    cols = ["action", "index_symbol", "month", "strike", "opt_type", "price", "qty", "raw_text", "created_at"]
+    return [dict(zip(cols, r)) for r in rows]
+
+# -------------------------
+# Position text parser
+# -------------------------
+def parse_position_text(text: str, user_id: int) -> dict:
+    """
+    Expected patterns (flexible):
+      BUY BANKNIFTY NOV 59500 CE @ 215 3 lots
+      SELL NIFTY DEC 22400 PE @ 85 100
+    Returns parsed dict or raises ValueError
+    """
+    raw = text.strip()
+    parts = raw.upper().replace("/", " ").replace(",", " ").split()
+    parsed = {"raw_text": raw, "user_id": user_id}
+    try:
+        # action
+        parsed["action"] = parts[0] if parts else "BUY"
+        # detect index
+        parsed["index_symbol"] = detect_index_from_text(raw)
+        # find month token (assume next after index or parts[1])
+        # brute-force: find first 3-letter month token among parts
+        month = None
+        months = set(["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"])
+        for p in parts:
+            if p in months:
+                month = p
+                break
+        parsed["month"] = month or ""
+        # find strike (first integer > 1000)
+        strike = None
+        for p in parts:
+            if p.isdigit() and int(p) > 1000:
+                strike = int(p); break
+        parsed["strike"] = strike or 0
+        # option type CE/PE
+        parsed["opt_type"] = "CE" if "CE" in parts else ("PE" if "PE" in parts else "")
+        # price: find token after '@' or last numeric that's small (<10000)
+        price = None
+        if "@" in parts:
+            atidx = parts.index("@")
+            if atidx + 1 < len(parts):
+                try: price = float(parts[atidx+1]); 
+                except: price = None
+        if price is None:
+            nums = [p for p in parts if (p.replace(".","",1).isdigit())]
+            for n in reversed(nums):
+                val = float(n)
+                if val < 10000:
+                    price = val
+                    break
+        parsed["price"] = float(price) if price is not None else 0.0
+        # qty: find last integer small (<=100000) or 'lots' mention
+        qty = 1
+        if "LOT" in raw.upper():
+            # capture number before 'LOT' token
+            tokens = raw.upper().split()
+            for i,tok in enumerate(tokens):
+                if "LOT" in tok and i>0:
+                    try:
+                        qty = int(tokens[i-1])
+                    except:
+                        qty = 1
+                    break
+            qty = qty * 1  # lot size handling is left to user (we keep raw qty)
+        else:
+            # find an integer that appears after price token or at end
+            try:
+                nums = [int(p) for p in parts if p.isdigit()]
+                if nums:
+                    qty = nums[-1]
+            except:
+                qty = 1
+        parsed["qty"] = int(qty)
+        return parsed
+    except Exception as e:
+        logger.exception("Position parse failed: %s", e)
+        raise ValueError("Invalid position format")
+
+# -------------------------
+# Telegram bot handlers
+# -------------------------
+def get_tier_keyboard():
     keyboard = [
-        [InlineKeyboardButton('Free', callback_data='tier_free')],
-        [InlineKeyboardButton('Copper', callback_data='tier_copper')],
-        [InlineKeyboardButton('Silver', callback_data='tier_silver')],
-        [InlineKeyboardButton('Gold', callback_data='tier_gold')],
-        [InlineKeyboardButton('Diamond', callback_data='tier_diamond')],
+        [InlineKeyboardButton("Free", callback_data="tier_free")],
+        [InlineKeyboardButton("Copper", callback_data="tier_copper")],
+        [InlineKeyboardButton("Silver", callback_data="tier_silver")],
+        [InlineKeyboardButton("Gold", callback_data="tier_gold")],
+        [InlineKeyboardButton("Diamond", callback_data="tier_diamond")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def start_handler(update: Update, context: CallbackContext):
+    user = update.effective_user
+    ensure_user(user.id)
+    update.message.reply_text("Welcome to GrokNifty AI Bot!\nSelect your tier:", reply_markup=get_tier_keyboard())
 
-def start_handler(update, context):
-    user = add_or_get_user(update.message.from_user.id)
-    update.message.reply_text('Welcome to GrokNifty! Choose tier:', reply_markup=get_tier_menu_markup())
-
-
-def tier_callback_handler(update, context):
+def tier_callback_handler(update: Update, context: CallbackContext):
     query = update.callback_query
-    user_id = query.from_user.id
-    tier = query.data.split('_')[1]
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE users SET tier=? WHERE user_id=?', (tier, user_id))
-    conn.commit()
-    conn.close()
-    query.answer()
-    query.edit_message_text(text=f'Tier set to {tier.capitalize()}')
+    user = query.from_user
+    tier = query.data.split("_",1)[1] if "_" in query.data else "free"
+    cur = DB_CONN.cursor()
+    cur.execute("UPDATE users SET tier = ? WHERE tg_id = ?", (tier, user.id))
+    DB_CONN.commit()
+    query.answer(text=f"Tier set to {tier.capitalize()}")
+    query.edit_message_text(text=f"Tier set to {tier.capitalize()}")
 
-
-def predict_on_demand(update, context):
+def position_message_handler(update: Update, context: CallbackContext):
+    user = update.effective_user
+    text = update.message.text
+    ensure_user(user.id)
     try:
-        df = fetch_historical()
-        df = compute_features(df)
-        pred_return, low, high, spot, pred_price, confidence = predict_next_move(df)
-        positions = get_positions_db(update.message.from_user.id)
-        pos_text = ''
-        for p in positions[:5]:
-            approx_pl, sign = estimate_option_pl(p, pred_price)
-            pos_text += f"- {p['action']} {p['index_symbol']} {p['month']} {p['strike']}{p['opt_type']} @ {p['price']} qty:{p['qty']} => EstPL:{approx_pl:.2f} ({sign})\n"
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M IST')
-        text = (
-            'GrokNifty Prediction (' + timestamp + '):\n'
-            f'Spot: {spot:.2f}\n'
-            f'Predicted Next Close: {pred_price:.2f} ({pred_return*100:.2f}%)\n'
-            f'Estimated Range: Low {low:.2f} — High {high:.2f}\n'
-            f'Confidence: {confidence*100:.1f}%\n'
+        parsed = parse_position_text(text, user.id)
+        save_position(parsed)
+        update.message.reply_text("✅ Position saved!", parse_mode=ParseMode.MARKDOWN)
+    except ValueError:
+        update.message.reply_text("❌ Invalid format.\nTry: BUY BANKNIFTY NOV 59500 CE @ 215 3 lots")
+
+def predict_command_handler(update: Update, context: CallbackContext):
+    user = update.effective_user
+    ensure_user(user.id)
+    # choose index based on latest position or user-provided param
+    try:
+        args = context.args or []
+        if args:
+            # user may choose explicit: /predict banknifty
+            idx = detect_index_from_text(" ".join(args))
+        else:
+            positions = get_positions_for_user(user.id, limit=1)
+            if positions:
+                idx = positions[0].get("index_symbol", "BANKNIFTY")
+            else:
+                idx = "BANKNIFTY"
+        # fetch df and predict
+        df = fetch_historical_df(idx, days=120)
+        out = predict_next(df, idx)
+        spot = out["spot"]
+        pred_price = out["pred_price"]
+        pred_return_pct = out["pred_return"] * 100
+        low = out["low"]
+        high = out["high"]
+        conf = out["confidence"] * 100
+        method = out.get("method", "fallback")
+        sentiment = out.get("sentiment", 0.0)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
+        # include user's last positions (up to 5)
+        positions = get_positions_for_user(user.id, limit=5)
+        pos_text = ""
+        for p in positions:
+            pos_text += f"\n• {p['action']} {p['index_symbol']} {p['month']} {p['strike']}{p['opt_type']} @ {p['price']} qty:{p['qty']}"
+        resp = (
+            f"*GrokNifty Prediction ({timestamp})*\n"
+            f"*Index:* {idx}\n"
+            f"*Spot:* {spot:.2f}\n"
+            f"*Predicted Next Close:* {pred_price:.2f} ({pred_return_pct:.2f}%)\n"
+            f"*Estimated Range:* Low {low:.2f} — High {high:.2f}\n"
+            f"*Confidence:* {conf:.1f}%\n"
+            f"*Sentiment:* {sentiment:.3f}\n"
+            f"*Method:* {method}\n"
         )
         if pos_text:
-            text += '\nPositions:\n' + pos_text
-        update.message.reply_text(text)
+            resp += f"\n*Positions:*{pos_text}"
+        update.message.reply_text(resp, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logger.exception('On-demand prediction failed: %s', e)
-        update.message.reply_text('Prediction failed. Try again later.')
+        logger.exception("Predict command failed: %s", e)
+        update.message.reply_text("Prediction failed. Try again later.")
 
+# Admin commands
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-def position_handler(update, context):
-    txt = update.message.text
-    parsed = parse_position_text(txt)
-    if not parsed:
-        update.message.reply_text("Invalid position format. Try: BUY BANKNIFTY NOV 59500 CE @ 215 3")
-        return
-    save_position_db(update.message.from_user.id, parsed)
-    update.message.reply_text(f"Position saved: {parsed}")
-
-
-# -------------------- Scheduler & Pushes --------------------
-
-def send_forecasts_to_tier(tier: str):
-    users_list = []
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT user_id FROM users WHERE tier=? AND subscribed=1', (tier,))
-    rows = c.fetchall()
-    conn.close()
-    users_list = [r[0] for r in rows]
-    if not users_list:
-        logger.info('No users for tier %s', tier)
+def admin_set_tier(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not is_admin(user.id):
+        update.message.reply_text("Not authorized.")
         return
     try:
-        df = fetch_historical()
-        df = compute_features(df)
-        pred_return, low, high, spot, pred_price, confidence = predict_next_move(df)
-        text_base = (
-            'GrokNifty Update (' + datetime.now().strftime('%Y-%m-%d %H:%M IST') + '):\n'
-            f'Spot: {spot:.2f}\n'
-            f'Pred: {pred_price:.2f} ({pred_return*100:.2f}%)\n'
-            f'Range: {low:.2f}-{high:.2f}\n'
-            f'Confidence: {confidence*100:.1f}%'
-        )
-        for user_id in users_list:
+        args = context.args
+        if len(args) < 2:
+            update.message.reply_text("Usage: /settier <tg_id> <tier>")
+            return
+        tg = int(args[0])
+        tier = args[1]
+        cur = DB_CONN.cursor()
+        cur.execute("UPDATE users SET tier = ? WHERE tg_id = ?", (tier, tg))
+        if cur.rowcount == 0:
+            # create user
+            cur.execute("INSERT OR IGNORE INTO users (tg_id, tier, created_at) VALUES (?, ?, ?)", (tg, tier, datetime.now().isoformat()))
+        DB_CONN.commit()
+        update.message.reply_text(f"Set tier {tier} for {tg}")
+    except Exception as e:
+        logger.exception("settier failed: %s", e)
+        update.message.reply_text("Failed to set tier.")
+
+def admin_train_now(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not is_admin(user.id):
+        update.message.reply_text("Not authorized.")
+        return
+    # train for both indices in background
+    update.message.reply_text("Training started (both indices).")
+    scheduler.add_job(lambda: train_job_wrapper("BANKNIFTY"), id=f"train_BN_{int(time.time())}")
+    scheduler.add_job(lambda: train_job_wrapper("NIFTY"), id=f"train_NF_{int(time.time())}")
+
+# training wrapper
+def train_job_wrapper(index_name: str):
+    logger.info("Manual training triggered for %s", index_name)
+    meta = train_model_for_index(index_name)
+    logger.info("Finished training: %s", meta)
+    return meta
+
+# -------------------------
+# Scheduler tasks
+# -------------------------
+def scheduled_daily_train():
+    # train both indexes at 02:00 IST
+    try:
+        logger.info("Daily scheduled training started")
+        train_model_for_index("BANKNIFTY")
+        train_model_for_index("NIFTY")
+        logger.info("Daily scheduled training finished")
+    except Exception as e:
+        logger.exception("Daily train failed: %s", e)
+
+def scheduled_auto_push(bot: Bot):
+    # Push short auto prediction to all users based on their last index
+    try:
+        logger.info("Auto push task running")
+        cur = DB_CONN.cursor()
+        cur.execute("SELECT tg_id FROM users")
+        rows = cur.fetchall()
+        for (tg,) in rows:
             try:
-                positions = get_positions_db(user_id)
-                pos_text = ''
-                if positions:
-                    for p in positions[:3]:
-                        approx_pl, sign = estimate_option_pl(p, pred_price)
-                        pos_text += f"- {p['action']} {p['index_symbol']} {p['month']} {p['strike']}{p['opt_type']} @ {p['price']} qty:{p['qty']} => EstPL:{approx_pl:.2f} ({sign})\n"
-                final = text_base + ('\nYour positions:\n' + pos_text if pos_text else '')
-                bot.send_message(chat_id=user_id, text=final)
-                save_prediction_db(user_id, spot, low, high, confidence)
+                positions = get_positions_for_user(tg, limit=1)
+                idx = positions[0]["index_symbol"] if positions else "BANKNIFTY"
+                df = fetch_historical_df(idx, days=90)
+                out = predict_next(df, idx)
+                text = (
+                    f"GrokNifty Auto ({idx})\n"
+                    f"Spot: {out['spot']:.2f}\n"
+                    f"Range: {out['low']:.2f} - {out['high']:.2f}\n"
+                    f"Confidence: {out['confidence']*100:.1f}%\n"
+                    f"Method: {out['method']}"
+                )
+                bot.send_message(chat_id=tg, text=text)
+                time.sleep(0.1)
             except Exception as e:
-                logger.warning('Failed to send to %s: %s', user_id, e)
+                logger.exception("Failed to push for %s: %s", tg, e)
     except Exception as e:
-        logger.exception('send_forecasts_to_tier failed: %s', e)
+        logger.exception("Auto push failed: %s", e)
 
-
-def schedule_jobs():
-    scheduler.remove_all_jobs()
-    tier_times = {
-        'free': ['09:10'],
-        'copper': ['09:10', '12:30'],
-        'silver': ['09:10', '11:00', '14:30'],
-        'gold': ['09:10', '09:30', '12:30', '14:30'],
-        'diamond': ['09:10', '09:15', '09:20', '09:25', '09:30', '10:00', '11:00', '12:00', '13:00', '14:00']
-    }
-    for tier, times in tier_times.items():
-        for hm in times:
-            hour, minute = map(int, hm.split(':'))
-            trigger = CronTrigger(hour=hour, minute=minute, timezone='Asia/Kolkata')
-            scheduler.add_job(lambda t=tier: send_forecasts_to_tier(t), trigger=trigger, id=f'{tier}_{hm.replace(":", "")}_{hour}_{minute}')
-    scheduler.start()
-    logger.info('Scheduler started with %d jobs', len(scheduler.get_jobs()))
-
-
-# -------------------- Graceful shutdown --------------------
-
-def shutdown_handler(signum, frame):
-    logger.info('Shutting down GrokNifty...')
-    try:
-        scheduler.shutdown(wait=False)
-    except Exception:
-        pass
-    try:
-        if updater:
-            updater.stop()
-    except Exception:
-        pass
-    logger.info('Shutdown complete')
-    sys.exit(0)
-
-
-import signal
-signal.signal(signal.SIGTERM, shutdown_handler)
-signal.signal(signal.SIGINT, shutdown_handler)
-
-
-# -------------------- CLI Runner --------------------
-
-def main_cli():
-    env = load_env()
-    token = env.get('TELEGRAM_TOKEN') or os.getenv('TELEGRAM_TOKEN')
-    ensure_dirs()
-    init_db()
-
-    if '--init-db' in sys.argv:
-        print('DB initialized')
-        return
-    if '--train' in sys.argv:
-        train_and_persist_model()
-        print('Training complete')
-        return
-
-    load_model()
-
-    global updater, bot
-    if not token:
-        logger.error('TELEGRAM_TOKEN not found. Set /etc/groknifty/groknifty.env or env var.')
-        print('Set TELEGRAM_TOKEN in /etc/groknifty/groknifty.env')
-        return
-
-    updater = Updater(token, use_context=True)
-    bot = updater.bot
+# -------------------------
+# Startup & main
+# -------------------------
+def main():
+    # Updater & Dispatcher
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    dp.add_handler(CommandHandler('start', start_handler))
-    dp.add_handler(CommandHandler('predict', predict_on_demand))
-    dp.add_handler(CallbackQueryHandler(tier_callback_handler))
-    dp.add_handler(MessageHandler(Filters.text & (~Filters.command), position_handler))
+    # Handlers
+    dp.add_handler(CommandHandler("start", start_handler))
+    dp.add_handler(CallbackQueryHandler(tier_callback_handler, pattern=r"^tier_"))
+    dp.add_handler(CommandHandler("predict", predict_command_handler))
+    dp.add_handler(MessageHandler(Filters.text & (~Filters.command), position_message_handler))
+    dp.add_handler(CommandHandler("settier", admin_set_tier))       # admin-only
+    dp.add_handler(CommandHandler("trainnow", admin_train_now))    # admin-only
 
-    schedule_jobs()
-    # Daily retrain at 18:45 IST
-    retrain_trigger = CronTrigger(hour=18, minute=45, timezone='Asia/Kolkata')
-    scheduler.add_job(train_and_persist_model, trigger=retrain_trigger, id='daily_retrain')
-
-    logger.info('Starting updater (polling)...')
+    # Start the updater
     updater.start_polling()
+    bot = updater.bot
+    logger.info("Bot polling started")
+
+    # Scheduler jobs
+    # daily training at 02:00 IST
+    try:
+        scheduler.add_job(scheduled_daily_train, "cron", hour=2, minute=0, id="daily_train")
+        # auto push before market open (example times - adjust as you like)
+        scheduler.add_job(partial(scheduled_auto_push, bot), "cron", hour=9, minute=10, id="auto_push_morning")
+        scheduler.add_job(partial(scheduled_auto_push, bot), "cron", hour=12, minute=0, id="auto_push_midday")
+        scheduler.start()
+        logger.info("Scheduler started with jobs: %s", scheduler.get_jobs())
+    except Exception as e:
+        logger.exception("Scheduler start failed: %s", e)
+
+    # Warm-start: if no model exists, train quickly (non-blocking)
+    for idx in ("BANKNIFTY", "NIFTY"):
+        model, _ = load_model_for_index(idx)
+        if model is None:
+            logger.info("No model found for %s, training now (background).", idx)
+            # schedule immediate training without blocking
+            scheduler.add_job(lambda i=idx: train_job_wrapper(i), id=f"startup_train_{idx}", replace_existing=True)
+
     updater.idle()
 
-
-if __name__ == '__main__':
-    main_cli()
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception("Fatal error in main: %s", e)
+        raise
