@@ -62,7 +62,9 @@ MODEL_FILE_NIFTY = os.path.join(MODEL_DIR, "model_nifty.joblib")
 MODEL_FILE_BANK = os.path.join(MODEL_DIR, "model_bank.joblib")
 
 # Prediction config
-MARKET_TZ = timezone(timedelta(hours=5, minutes=30))  # IST
+#MARKET_TZ = timezone(timedelta(hours=5, minutes=30))  # IST
+import pytz
+MARKET_TZ = pytz.timezone("Asia/Kolkata")
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 
