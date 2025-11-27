@@ -1,20 +1,25 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# ============================
+#   GROKNIFTY PRODUCTION BOT
+#   Option C – Full Dynamic Bot
+#   With Tiers, Admin Controls,
+#   NIFTY + BANKNIFTY Predictions
+#   pytz Scheduler (APScheduler Safe)
+# ============================
 
 import os
-import time
-import json
 import logging
-import requests
-import sqlite3
-import traceback
+import pytz
 from datetime import datetime
-from bs4 import BeautifulSoup
+from apscheduler.schedulers.background import BackgroundScheduler
 
+import requests
 import yfinance as yf
+from bs4 import BeautifulSoup
 import pandas as pd
 from nltk.sentiment import SentimentIntensityAnalyzer
-from apscheduler.schedulers.background import BackgroundScheduler
+import nltk
+nltk.download("vader_lexicon")
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -23,296 +28,273 @@ from telegram import (
 from telegram.ext import (
     Updater,
     CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    Filters,
     CallbackContext,
+    MessageHandler,
+    Filters,
+    CallbackQueryHandler,
 )
 
-# -------------------------
-# Logging
-# -------------------------
+# ============ LOGGER =============
+
 logging.basicConfig(
     filename="groknifty.log",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# -------------------------
-# ENV
-# -------------------------
+# ============ READ ENV =============
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_IDS = ["9898989898"]  # <---- Replace with your Telegram User ID
-
 if not TELEGRAM_TOKEN:
-    print("ERROR: TELEGRAM_TOKEN not set")
-    exit(1)
+    print("ERROR: TELEGRAM_TOKEN missing")
+    exit()
 
-# -------------------------
-# DB
-# -------------------------
-DB_PATH = "grok.db"
+ADMIN_USER_ID = 123456789   # <<< REPLACE WITH YOUR USER ID
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT PRIMARY KEY,
-            tier TEXT DEFAULT 'free',
-            created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+TZ = pytz.timezone("Asia/Kolkata")
 
-def set_user_tier(user_id, tier):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO users(user_id, tier) VALUES (?,?)", (user_id, tier))
-    conn.commit()
-    conn.close()
+# ============ GLOBAL DB =============
 
-def get_user_tier(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT tier FROM users WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else "free"
-
-# -------------------------
-# Sentiment
-# -------------------------
+users = {}  # {user_id: {"tier":..., "positions": []}}
 sia = SentimentIntensityAnalyzer()
 
-# -------------------------
-# Data Fetching
-# -------------------------
-def fetch_pre_market(index="BANKNIFTY"):
+NEWS_URL = "https://www.moneycontrol.com/news/business/markets/"
+FII_DII_URL = "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.html"
 
-    if index == "NIFTY":
-        symbol = "^NSEI"
-    else:
-        symbol = "^NSEBANK"
+# -------------------------------------------
+# FETCH SENTIMENT + FII DII + PRICES
+# -------------------------------------------
 
+def fetch_pre_market(index="NIFTY"):
     try:
-        data = yf.download(symbol, period="1d")
-        spot = float(data["Close"].iloc[-1]) if not data.empty else 20000
+        symbol = "^NSEI" if index == "NIFTY" else "^NSEBANK"
+        df = yf.download(symbol, period="1d")
+        spot = float(df["Close"].iloc[-1]) if not df.empty else 0
     except:
-        spot = 20000
+        spot = 0
 
     try:
-        r = requests.get("https://www.moneycontrol.com/news/business/markets/")
-        soup = BeautifulSoup(r.text, "html.parser")
-        headlines = [h.text.strip() for h in soup.find_all("h2")[:10]]
-        sentiment = sum(sia.polarity_scores(h)["compound"] for h in headlines) / len(headlines)
+        resp = requests.get(FII_DII_URL, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        fii = soup.select_one(".fii span.value")
+        dii = soup.select_one(".dii span.value")
+        fii_val = float(fii.text.replace(",", "")) if fii else 0
+        dii_val = float(dii.text.replace(",", "")) if dii else 0
+    except:
+        fii_val = 0
+        dii_val = 0
+
+    try:
+        resp = requests.get(NEWS_URL, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        headlines = [h.text.strip() for h in soup.find_all("h2", limit=10)]
+        sentiment = (
+            sum(sia.polarity_scores(h)["compound"] for h in headlines) / len(headlines)
+            if headlines
+            else 0
+        )
     except:
         sentiment = 0
 
-    try:
-        fii, dii = 0, 0
-        r = requests.get("https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.html")
-        soup = BeautifulSoup(r.text, "html.parser")
-        nums = soup.find_all("span", {"class": "stprc"})
-        if len(nums) >= 2:
-            fii = float(nums[0].text.replace(",", ""))
-            dii = float(nums[1].text.replace(",", ""))
-    except:
-        fii, dii = 0, 0
+    bias = (dii_val - fii_val) / 1000 + sentiment * 5
+    return spot, fii_val, dii_val, sentiment, bias
 
-    return spot, fii, dii, sentiment
 
-# -------------------------
-# Prediction Logic
-# -------------------------
-def predict_range(index="BANKNIFTY", user_positions=None):
-    spot, fii, dii, sentiment = fetch_pre_market(index)
-    
-    bias = (dii - fii) / 1000 + (sentiment * 10)
+def predict_range(spot, bias):
+    low = spot - 200 + (bias * 50)
+    high = spot + 200 + (bias * 50)
+    return low, high
 
-    if index == "BANKNIFTY":
-        base = 250
-    else:
-        base = 120
 
-    low = spot - base + (bias * 40)
-    high = spot + base + (bias * 40)
+# -------------------------------------------
+# TIER SYSTEM
+# -------------------------------------------
 
-    if user_positions:
-        for pos in user_positions:
-            if pos["action"] == "BUY":
-                high += 20
-            else:
-                low -= 20
+TIERS = ["free", "silver", "gold", "diamond"]
 
-    return {
-        "spot": round(spot, 2),
-        "low": round(low, 2),
-        "high": round(high, 2),
-        "fii": fii,
-        "dii": dii,
-        "sentiment": sentiment
-    }
-
-# -------------------------
-# Telegram Bot Core
-# -------------------------
-def send_tier_menu(update, context):
-    keyboard = [
+def tier_menu():
+    kb = [
         [InlineKeyboardButton("Free", callback_data="tier_free")],
-        [InlineKeyboardButton("Copper", callback_data="tier_copper")],
         [InlineKeyboardButton("Silver", callback_data="tier_silver")],
         [InlineKeyboardButton("Gold", callback_data="tier_gold")],
         [InlineKeyboardButton("Diamond", callback_data="tier_diamond")],
     ]
-    update.message.reply_text(
-        "Choose your subscription tier:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    return InlineKeyboardMarkup(kb)
+
 
 def start(update: Update, context: CallbackContext):
-    user_id = str(update.message.from_user.id)
-    set_user_tier(user_id, get_user_tier(user_id))
+    user_id = update.message.from_user.id
+    if user_id not in users:
+        users[user_id] = {"tier": "free", "positions": []}
 
-    send_tier_menu(update, context)
+    update.message.reply_text(
+        "👋 Welcome to GrokNifty AI Bot!\nChoose your tier:",
+        reply_markup=tier_menu(),
+    )
+
 
 def tier_callback(update: Update, context: CallbackContext):
     query = update.callback_query
-    user_id = str(query.from_user.id)
     tier = query.data.split("_")[1]
+    user_id = query.from_user.id
 
-    set_user_tier(user_id, tier)
+    users[user_id]["tier"] = tier
+    query.answer(f"Tier selected: {tier.capitalize()}")
+    query.edit_message_text(f"✅ Tier Updated: {tier.capitalize()}")
 
-    query.answer("Tier updated to " + tier.capitalize())
+
+# -------------------------------------------
+# ADMIN SET TIER
+# -------------------------------------------
 
 def admin_set_tier(update: Update, context: CallbackContext):
-    user_id = str(update.message.from_user.id)
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("Not authorized.")
-        return
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_USER_ID:
+        return update.message.reply_text("❌ You are not admin")
 
     try:
-        target = context.args[0]
-        tier = context.args[1]
-        set_user_tier(target, tier)
-        update.message.reply_text(f"Updated {target} to {tier}")
-    except:
-        update.message.reply_text("Use: /settier <user_id> <tier>")
+        target = int(context.args[0])
+        tier = context.args[1].lower()
 
-# -------------------------
-# User Message Parsing (Positions)
-# -------------------------
-user_positions = {}
+        if tier not in TIERS:
+            return update.message.reply_text("❌ Invalid tier")
+
+        if target not in users:
+            users[target] = {"tier": tier, "positions": []}
+        else:
+            users[target]["tier"] = tier
+
+        update.message.reply_text(f"✅ Updated Tier for {target} → {tier}")
+
+    except:
+        update.message.reply_text("Format:\n/settier <user_id> <tier>")
+
+
+# -------------------------------------------
+# PROCESS USER POSITION INPUT
+# -------------------------------------------
 
 def parse_position(text):
+    """
+    BUY BANKNIFTY 48000 CE @ 215 2 lots
+    BUY NIFTY 22000 PE @ 165 50 qty
+    """
     try:
         words = text.upper().split()
-        action = words[0]  # BUY/SELL
-        index = words[1]   # NIFTY/BANKNIFTY
+        action = words[0]
+        index = words[1]
         strike = int(words[2])
-        opt_type = words[3]  # CE/PE
+        opt_type = words[3]
         price = float(words[words.index("@") + 1])
+
+        qty = 50  # default
+        if "LOTS" in words:
+            lot_idx = words.index("LOTS")
+            lots = int(words[lot_idx - 1])
+            qty = lots * (50 if index == "NIFTY" else 25)
+        elif words[-1].isdigit():
+            qty = int(words[-1])
+
         return {
             "action": action,
             "index": index,
             "strike": strike,
             "type": opt_type,
-            "price": price
+            "price": price,
+            "qty": qty,
         }
     except:
         return None
 
-def handle_message(update: Update, context: CallbackContext):
-    user_id = str(update.message.from_user.id)
-    text = update.message.text.strip()
 
-    pos = parse_position(text)
-    if pos:
-        if user_id not in user_positions:
-            user_positions[user_id] = []
-        user_positions[user_id].append(pos)
-        update.message.reply_text(f"Position added: {pos}")
-        return
+def handle_position(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
 
-    update.message.reply_text("Invalid input. Example:\nBUY BANKNIFTY 45200 CE @ 215")
+    if users[user_id]["tier"] == "free":
+        return update.message.reply_text("❌ Free tier users cannot add positions")
 
-# -------------------------
-# Prediction Command
-# -------------------------
-def predict(update: Update, context: CallbackContext):
-    user_id = str(update.message.from_user.id)
-    tier = get_user_tier(user_id)
+    pos = parse_position(update.message.text)
+    if not pos:
+        return update.message.reply_text("❌ Invalid format\n\nUse: BUY BANKNIFTY 48000 CE @ 215 2 lots")
 
-    if tier == "free":
-        update.message.reply_text("Upgrade your tier to access predictions.")
-        return
+    users[user_id]["positions"].append(pos)
+    update.message.reply_text(f"✅ Position Added:\n{pos}")
 
-    p1 = predict_range("NIFTY", user_positions.get(user_id))
-    p2 = predict_range("BANKNIFTY", user_positions.get(user_id))
 
-    msg = f"""
-📊 **GrokNifty Prediction**
+# -------------------------------------------
+# MANUAL PREDICTION
+# -------------------------------------------
 
-**NIFTY**
-Spot: {p1['spot']}
-Range: {p1['low']} → {p1['high']}
+def command_predict(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
 
-**BANKNIFTY**
-Spot: {p2['spot']}
-Range: {p2['low']} → {p2['high']}
+    for index in ["NIFTY", "BANKNIFTY"]:
+        spot, fii, dii, sentiment, bias = fetch_pre_market(index)
+        low, high = predict_range(spot, bias)
 
-FII: {p1['fii']}
-DII: {p1['dii']}
-Sentiment: {round(p1['sentiment'], 3)}
-"""
-    update.message.reply_text(msg, parse_mode="Markdown")
+        update.message.reply_text(
+            f"📊 *{index} Prediction*\n"
+            f"Spot: {spot}\n"
+            f"FII: {fii}\nDII: {dii}\n"
+            f"Sentiment: {sentiment}\n"
+            f"Range: {low} - {high}",
+            parse_mode="Markdown",
+        )
 
-# -------------------------
-# Scheduler
-# -------------------------
-scheduler = BackgroundScheduler()
 
-def auto_push(context):
-    for user_id in list(user_positions.keys()):
-        try:
-            p1 = predict_range("NIFTY", user_positions.get(user_id))
-            p2 = predict_range("BANKNIFTY", user_positions.get(user_id))
+# -------------------------------------------
+# AUTO DAILY PUSH
+# -------------------------------------------
 
-            text = f"""
-📈 **Auto Update**
+def auto_push(bot):
+    for uid in users:
+        for index in ["NIFTY", "BANKNIFTY"]:
+            spot, fii, dii, sentiment, bias = fetch_pre_market(index)
+            low, high = predict_range(spot, bias)
 
-NIFTY → {p1['low']} - {p1['high']}
-BANKNIFTY → {p2['low']} - {p2['high']}
-"""
-            context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
-        except:
-            logging.error(traceback.format_exc())
+            bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"📈 *Auto {index} Prediction*\n"
+                    f"Spot: {spot}\n"
+                    f"Range: {low} - {high}"
+                ),
+                parse_mode="Markdown",
+            )
+
+
+# -------------------------------------------
+# SCHEDULER
+# -------------------------------------------
 
 def start_scheduler(updater):
-    scheduler.add_job(auto_push, "cron", hour=9, minute=15, args=[updater.bot])
-    scheduler.add_job(auto_push, "cron", hour=12, minute=0, args=[updater.bot])
+    scheduler = BackgroundScheduler(timezone=TZ)
+
+    scheduler.add_job(auto_push, "cron", hour=9, minute=10, args=[updater.bot], timezone=TZ)
+    scheduler.add_job(auto_push, "cron", hour=12, minute=0, args=[updater.bot], timezone=TZ)
+
     scheduler.start()
 
-# -------------------------
-# Main
-# -------------------------
-def main():
-    init_db()
 
+# -------------------------------------------
+# MAIN
+# -------------------------------------------
+
+def main():
     updater = Updater(TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CallbackQueryHandler(tier_callback))
-    dp.add_handler(CommandHandler("predict", predict))
+    dp.add_handler(CommandHandler("predict", command_predict))
     dp.add_handler(CommandHandler("settier", admin_set_tier))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    dp.add_handler(CallbackQueryHandler(tier_callback))
+    dp.add_handler(MessageHandler(Filters.text, handle_position))
 
     start_scheduler(updater)
 
     updater.start_polling()
     updater.idle()
+
 
 if __name__ == "__main__":
     main()
